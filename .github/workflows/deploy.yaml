@@ -1,0 +1,94 @@
+# S0 app CI/CD: test on GitHub-hosted runners, publish an arm64 image to GHCR,
+# then deploy it from the app host's self-hosted runner.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "deploy/compose.app.yaml"
+      - "deploy/traefik/**"
+      - ".github/workflows/deploy.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
+      - name: Test the app
+        run: make test-app
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Set image name and tag
+        id: image
+        run: |
+          echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: app
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.prefix }}/app:${{ steps.image.outputs.tag }}
+          build-args: GIT_SHA=${{ github.sha }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,scope=app,mode=max
+
+  deploy:
+    needs: image
+    runs-on: [self-hosted, lab-app]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: ${{ needs.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Start the app stack
+        run: |
+          docker compose -f deploy/compose.app.yaml pull
+          docker compose -f deploy/compose.app.yaml up -d --wait --remove-orphans
+      - name: Smoke test the deployed API
+        run: |
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 3 http://127.0.0.1/version \
+            | jq -e --arg sha "$GITHUB_SHA" '.git_sha == $sha'
+          curl -fsS http://127.0.0.1/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"pickup_zone_id":132,"dropoff_zone_id":230,"pickup_datetime":"2024-03-08T17:05:00"}' \
+            | jq -e '.duration_minutes == 12.25'
+          code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"pickup_zone_id":-1,"dropoff_zone_id":230,"pickup_datetime":"2024-03-08T17:05:00"}')
+          test "$code" = 422
